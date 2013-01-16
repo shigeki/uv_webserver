@@ -1,8 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
-#include "uv/uv.h"
-#include "http_parser/http_parser.h"
+#include "libuv/include/uv.h"
+#include "http-parser/http_parser.h"
 
 
 #define RESPONSE \
@@ -17,9 +17,9 @@ static uv_tcp_t server;
 static http_parser_settings settings;
 
 typedef struct {
-  uv_tcp_t handle;
+  uv_tcp_t tcp;
   http_parser parser;
-  uv_req_t write_req;
+  uv_write_t write_req;
 } client_t;
 
 
@@ -28,7 +28,7 @@ void on_close(uv_handle_t* handle) {
 }
 
 
-uv_buf_t on_alloc(uv_tcp_t* handle, size_t suggested_size) {
+static uv_buf_t on_alloc(uv_handle_t* handle, size_t suggested_size) {
   uv_buf_t buf;
   buf.base = malloc(suggested_size);
   buf.len = suggested_size;
@@ -36,10 +36,9 @@ uv_buf_t on_alloc(uv_tcp_t* handle, size_t suggested_size) {
 }
 
 
-void on_read(uv_tcp_t* handle, int nread, uv_buf_t buf) {
+static void on_read(uv_stream_t* handle, int nread, uv_buf_t buf) {
   client_t* client = handle->data;
   size_t parsed;
-
 
   if (nread >= 0) {
     /* parse http */
@@ -55,7 +54,7 @@ void on_read(uv_tcp_t* handle, int nread, uv_buf_t buf) {
     }
 
   } else { 
-    uv_err_t err = uv_last_error();
+    uv_err_t err = uv_last_error(handle->loop);
 
     if (err.code == UV_EOF) {
       /* do nothing */
@@ -70,42 +69,41 @@ void on_read(uv_tcp_t* handle, int nread, uv_buf_t buf) {
 }
 
 
-void on_connected(uv_tcp_t* s, int status) {
-  assert(s == &server);
+void on_connected(uv_stream_t* s, int status) {
+  assert(s == (uv_stream_t*)&server);
   assert(status == 0);
 
 
   client_t* client = malloc(sizeof(client_t));
 
-  int r = uv_accept(&server, &client->handle);
+
+  int r = uv_tcp_init(s->loop, &client->tcp);
+  r = uv_accept((uv_stream_t*)&server, (uv_stream_t*)&client->tcp);
 
   if (r) { 
-    uv_err_t err = uv_last_error();
+    uv_err_t err = uv_last_error(s->loop);
     fprintf(stderr, "accept: %s\n", uv_strerror(err));
     return;
   }
 
-  client->handle.data = client;
+  client->tcp.data = client;
   client->parser.data = client;
 
   http_parser_init(&client->parser, HTTP_REQUEST);
 
-  uv_read_start(&client->handle, on_alloc, on_read);
+  uv_read_start((uv_stream_t*)&client->tcp, on_alloc, on_read);
 }
 
-void after_write(uv_req_t* req, int status) {
-  uv_close(req->handle, on_close);
+static void write_cb(uv_write_t* req, int status) {
+  uv_close((uv_handle_t*)req->data, on_close);
 }
 
 
 int on_headers_complete(http_parser* parser) {
   client_t* client = parser->data;
 
-  uv_tcp_t* handle = &client->handle;
-
-  uv_req_init(&client->write_req, (uv_handle_t*)handle, after_write);
-
-  uv_write(&client->write_req, &resbuf, 1);
+  client->write_req.data = client;
+  uv_write(&client->write_req, (uv_stream_t*)&client->tcp, &resbuf, 1, write_cb);
 
   return 1;
 }
@@ -113,32 +111,31 @@ int on_headers_complete(http_parser* parser) {
 
 
 int main() {
-  uv_init();
 
   resbuf.base = RESPONSE;
   resbuf.len = sizeof(RESPONSE);
 
   settings.on_headers_complete = on_headers_complete;
 
-  uv_tcp_init(&server);
+  uv_tcp_init(uv_default_loop(), &server);
 
-  int r = uv_bind(&server, uv_ip4_addr("0.0.0.0", 8000));
+  int r = uv_tcp_bind(&server, uv_ip4_addr("0.0.0.0", 8000));
 
   if (r) { 
-    uv_err_t err = uv_last_error();
+    uv_err_t err = uv_last_error(server.loop);
     fprintf(stderr, "bind: %s\n", uv_strerror(err));
     return -1;
   }
 
-  r = uv_listen(&server, 128, on_connected);
+  r = uv_listen((uv_stream_t*)&server, 128, on_connected);
 
   if (r) { 
-    uv_err_t err = uv_last_error();
+    uv_err_t err = uv_last_error(server.loop);
     fprintf(stderr, "listen: %s\n", uv_strerror(err));
     return -1;
   }
 
-  uv_run();
+  uv_run(server.loop);
 
   return 0;
 }
